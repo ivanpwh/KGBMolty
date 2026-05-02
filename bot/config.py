@@ -9,11 +9,22 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Skill / API version ──────────────────────────────────────────────
-SKILL_VERSION = "1.5.2"
+SKILL_VERSION = "1.6.0"
+_runtime_version = [SKILL_VERSION]  # mutable container updated at startup
+
+
+def get_skill_version() -> str:
+    return _runtime_version[0]
+
+
+def set_skill_version(v: str) -> None:
+    _runtime_version[0] = v
+
 
 # ── URLs ──────────────────────────────────────────────────────────────
 API_BASE = "https://cdn.moltyroyale.com/api"
 WS_URL = "wss://cdn.moltyroyale.com/ws/agent"
+WS_JOIN_URL = "wss://cdn.moltyroyale.com/ws/join"  # unified join (v1.6.0+)
 
 # ── Chain config (CROSS Mainnet) ──────────────────────────────────────
 CROSS_CHAIN_ID = 612055

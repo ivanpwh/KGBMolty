@@ -5,7 +5,7 @@ All endpoints from api-summary.md with rate limiting and error handling.
 import json
 import httpx
 from typing import Optional
-from bot.config import API_BASE, SKILL_VERSION
+from bot.config import API_BASE, get_skill_version, set_skill_version
 from bot.utils.logger import get_logger
 from bot.utils.rate_limiter import rest_limiter
 
@@ -36,10 +36,25 @@ class MoltyAPI:
             )
 
     def _headers(self) -> dict:
-        h = {"X-Version": SKILL_VERSION}
+        h = {"X-Version": get_skill_version()}
         if self.api_key:
             h["X-API-Key"] = self.api_key
         return h
+
+    async def fetch_live_version(self) -> str:
+        """Fetch server version without X-Version header (avoids 426 bootstrap)."""
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"{API_BASE}/version", timeout=10.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    ver = data.get("version", "")
+                    if ver:
+                        set_skill_version(ver)
+                    return ver
+        except Exception as e:
+            log.warning("Live version fetch failed: %s", e)
+        return ""
 
     def _safe_parse_json(self, text: str) -> dict:
         """Parse JSON safely, handling malformed/concatenated responses."""

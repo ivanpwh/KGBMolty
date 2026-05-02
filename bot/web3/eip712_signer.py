@@ -19,8 +19,7 @@ def sign_join_paid(agent_private_key: str, eip712_data: dict) -> str:
     types = eip712_data["types"]
     message = eip712_data["message"]
 
-    # encode_typed_data expects the primaryType
-    primary_type = "JoinTournament"
+    primary_type = eip712_data.get("primaryType", "JoinTournament")
 
     signable = encode_typed_data(
         primaryType=primary_type,

@@ -13,7 +13,7 @@ Per game-loop.md:
 import json
 import asyncio
 import websockets
-from bot.config import WS_URL, SKILL_VERSION
+from bot.config import WS_URL, get_skill_version
 from bot.credentials import get_api_key
 from bot.game.action_sender import ActionSender, COOLDOWN_ACTIONS, FREE_ACTIONS
 from bot.strategy.brain import decide_action, reset_game_state, learn_from_map
@@ -76,73 +76,99 @@ class WebSocketEngine:
         self.dashboard_key = agent_id  # fallback to agent_id
         self.dashboard_name = "Agent"
 
-    async def run(self) -> dict:
+    async def run(self, existing_ws=None) -> dict:
         """
         Main gameplay loop. Returns game result dict.
-        Per gotchas.md: connect with X-API-Key only, no gameId/agentId params.
+        existing_ws: already-open socket from /ws/join (v1.6.0+ unified flow).
+        If None, connects /ws/agent directly (resume after crash).
         """
+        self._running = True
+
+        if existing_ws:
+            log.info("Using existing /ws/join socket for game=%s", self.game_id or "(resolving)")
+            await self._run_session(existing_ws)
+            # If socket dropped before game_ended, fall back to /ws/agent reconnect
+            if not self.game_result and self._running:
+                log.info("Join socket dropped mid-game — reconnecting via /ws/agent")
+                await self._connect_and_run()
+        else:
+            await self._connect_and_run()
+
+        return self.game_result or {"status": "disconnected"}
+
+    async def _connect_and_run(self):
+        """Connect /ws/agent with reconnect logic. Used for resume-after-crash."""
         api_key = get_api_key()
         headers = {
             "X-API-Key": api_key,
-            "X-Version": SKILL_VERSION,
+            "X-Version": get_skill_version(),
         }
-
-        self._running = True
         retry_count = 0
         max_retries = 5
 
         while self._running and retry_count < max_retries:
             try:
-                log.info("Connecting WebSocket to %s...", WS_URL)
+                log.info("Connecting /ws/agent... (attempt %d)", retry_count + 1)
                 async with websockets.connect(
                     WS_URL,
                     additional_headers=headers,
-                    ping_interval=None,  # We handle our own pings
-                    max_size=2**20,  # 1MB max message
+                    ping_interval=None,
+                    max_size=2 ** 20,
                 ) as ws:
-                    self.ws = ws
-                    retry_count = 0  # Reset on successful connect
-                    log.info("✅ WebSocket connected for game=%s", self.game_id)
-
-                    # Start ping keepalive
-                    self._ping_task = asyncio.create_task(self._ping_loop())
-
-                    # Message processing loop
-                    async for raw_msg in ws:
-                        try:
-                            msg = json.loads(raw_msg)
-                            if not isinstance(msg, dict):
-                                log.warning("Non-dict WS message: %s", type(msg).__name__)
-                                continue
-                            msg_type = msg.get("type", "unknown")
-                            log.debug("WS recv: type=%s", msg_type)
-                            result = await self._handle_message(msg)
-                            if result is not None:
-                                self._running = False
-                                return result
-                        except json.JSONDecodeError:
-                            log.warning("Non-JSON message: %s", raw_msg[:100])
-
+                    retry_count = 0
+                    await self._run_session(ws)
+                    if self.game_result:
+                        return
             except websockets.exceptions.ConnectionClosed as e:
                 retry_count += 1
                 log.warning("WebSocket closed: code=%s reason=%s (retry %d/%d)",
                             e.code, e.reason, retry_count, max_retries)
-                if self._ping_task:
-                    self._ping_task.cancel()
                 await asyncio.sleep(min(2 ** retry_count, 30))
-
             except Exception as e:
                 retry_count += 1
                 log.error("WebSocket error: %s (retry %d/%d)", e, retry_count, max_retries)
-                if self._ping_task:
-                    self._ping_task.cancel()
                 await asyncio.sleep(min(2 ** retry_count, 30))
 
-        return self.game_result or {"status": "disconnected"}
+    async def _run_session(self, ws):
+        """Process messages from an open WebSocket until game ends or socket closes."""
+        self.ws = ws
+        self._ping_task = asyncio.create_task(self._ping_loop())
+        log.info("WebSocket session started (game=%s)", self.game_id or "pending")
+        try:
+            async for raw_msg in ws:
+                try:
+                    msg = json.loads(raw_msg)
+                    if not isinstance(msg, dict):
+                        log.warning("Non-dict WS message: %s", type(msg).__name__)
+                        continue
+                    log.debug("WS recv: type=%s", msg.get("type", "unknown"))
+                    result = await self._handle_message(msg)
+                    if result is not None:
+                        self._running = False
+                        return
+                except json.JSONDecodeError:
+                    log.warning("Non-JSON message: %s", raw_msg[:100])
+        except websockets.exceptions.ConnectionClosed as e:
+            log.warning("WebSocket closed: code=%s reason=%s", e.code, e.reason)
+        finally:
+            if self._ping_task:
+                self._ping_task.cancel()
+            self.ws = None
+            try:
+                await ws.close()
+            except Exception:
+                pass
 
     async def _handle_message(self, msg: dict) -> dict | None:
         """Process a single WebSocket message. Returns game result or None."""
         msg_type = msg.get("type", "")
+
+        # Resolve game_id/agent_id from first gameplay frame (ALREADY_IN_GAME case)
+        if not self.game_id and msg_type in ("agent_view", "waiting"):
+            self.game_id = msg.get("gameId", "")
+            self.agent_id = msg.get("agentId", "")
+            if self.game_id:
+                log.info("Resolved game_id=%s agent_id=%s", self.game_id[:12], self.agent_id[:12])
 
         # ── agent_view ────────────────────────────────────────────────
         # Per game-loop.md: uses 'view' key for state data

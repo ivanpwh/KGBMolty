@@ -14,6 +14,7 @@ from bot.setup.identity import ensure_identity
 from bot.game.room_selector import select_room
 from bot.game.free_join import join_free_game
 from bot.game.paid_join import join_paid_game
+from bot.config import set_skill_version
 from bot.game.websocket_engine import WebSocketEngine
 from bot.game.settlement import settle_game
 from bot.memory.agent_memory import AgentMemory
@@ -70,6 +71,11 @@ class Heartbeat:
             return
 
         self.api = MoltyAPI(creds.get("api_key", "") or get_api_key())
+
+        # Sync skill version from server — prevents VERSION_MISMATCH on future requests
+        live_ver = await self.api.fetch_live_version()
+        if live_ver:
+            log.info("Skill version synced from server: %s", live_ver)
 
         # Feed dashboard
         dashboard_state.bots_running = 1
@@ -195,11 +201,14 @@ class Heartbeat:
         """Join a game based on room selection."""
         room_type = select_room(me)
 
+        ws = None
+        game_id = ""
+        agent_id = ""
         try:
             if room_type == "paid":
-                game_id, agent_id = await join_paid_game(self.api)
+                ws, game_id, agent_id = await join_paid_game(self.api)
             else:
-                game_id, agent_id = await join_free_game(self.api)
+                ws, game_id, agent_id = await join_free_game()
         except APIError as e:
             if e.code == "NO_IDENTITY":
                 log.error("Identity required. Will setup next cycle.")
@@ -212,8 +221,8 @@ class Heartbeat:
             await asyncio.sleep(10)
             return
 
-        # Successfully joined → play
-        await self._play_game(game_id, agent_id, room_type)
+        # Successfully joined — ws is the live gameplay socket
+        await self._play_game(game_id, agent_id, room_type, existing_ws=ws)
 
     async def _handle_in_game(self, ctx: dict):
         """Resume or start playing an active game.
@@ -229,9 +238,9 @@ class Heartbeat:
 
         await self._play_game(game_id, agent_id, entry_type)
 
-    async def _play_game(self, game_id: str, agent_id: str, entry_type: str):
+    async def _play_game(self, game_id: str, agent_id: str, entry_type: str, existing_ws=None):
         """Run the WebSocket gameplay engine."""
-        log.info("═══ PLAYING GAME: %s (type=%s) ═══", game_id, entry_type)
+        log.info("═══ PLAYING GAME: %s (type=%s) ═══", game_id or "(resolving)", entry_type)
 
         # Feed dashboard — use SAME key as heartbeat so no duplicate card
         dashboard_state.update_agent(self._agent_key, {
@@ -249,7 +258,7 @@ class Heartbeat:
         engine = WebSocketEngine(game_id, agent_id)
         engine.dashboard_key = self._agent_key
         engine.dashboard_name = self._agent_name
-        game_result = await engine.run()
+        game_result = await engine.run(existing_ws=existing_ws)
 
         # Settle
         await settle_game(game_result, entry_type, self.memory)

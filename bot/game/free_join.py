@@ -1,74 +1,132 @@
 """
-Free game join via matchmaking queue.
-POST /join (Long Poll ~15s) → assigned → open WS immediately.
-No extra sleep between retries per free-games.md.
+Free game join via unified /ws/join WebSocket (v1.6.0+).
+Dial /ws/join → read welcome → send hello {entryType: free} → wait for assigned.
+The same socket becomes the gameplay socket — return it to the caller.
 """
-from bot.api_client import MoltyAPI, APIError
+import json
+import asyncio
+import websockets
+from bot.config import WS_JOIN_URL, get_skill_version
+from bot.api_client import APIError
+from bot.credentials import get_api_key
 from bot.utils.logger import get_logger
 
 log = get_logger(__name__)
 
+MAX_REDIAL = 10
 
-async def join_free_game(api: MoltyAPI) -> tuple[str, str]:
+
+async def join_free_game() -> tuple:
     """
-    Enter free matchmaking queue and wait for assignment.
-    Returns (game_id, agent_id) when assigned.
+    Connect /ws/join and complete the free matchmaking handshake.
+    Returns (ws, game_id, agent_id). The socket is already the gameplay socket.
+    game_id/agent_id are empty when decision was ALREADY_IN_GAME (read from first agent_view).
+    Caller owns the socket and must close it when done.
     """
-    # Idempotency guard: check queue status first
-    try:
-        status_resp = await api.get_join_status()
-        if isinstance(status_resp, dict):
-            status = status_resp.get("status", "not_queued")
-            if status == "assigned":
-                gid = status_resp.get("gameId", "")
-                aid = status_resp.get("agentId", "")
-                if gid and aid:
-                    log.info("Already assigned to game: %s", gid)
-                    return gid, aid
-            elif status == "queued":
-                log.info("Already in queue, resuming...")
-    except APIError:
-        pass
+    api_key = get_api_key()
+    headers = {
+        "X-API-Key": api_key,
+        "X-Version": get_skill_version(),
+    }
 
-    # Queue loop — no extra sleep, server Long Poll throttles (per free-games.md)
-    attempt = 0
-    while True:
-        attempt += 1
-        log.info("Free queue attempt #%d...", attempt)
-
+    for attempt in range(1, MAX_REDIAL + 1):
+        log.info("Free join attempt #%d via /ws/join...", attempt)
+        ws = None
         try:
-            resp = await api.post_join("free")
-            if not isinstance(resp, dict):
-                log.warning("Unexpected join response type: %s", type(resp).__name__)
+            ws = await websockets.connect(
+                WS_JOIN_URL,
+                additional_headers=headers,
+                ping_interval=None,
+                max_size=2 ** 20,
+            )
+
+            raw = await asyncio.wait_for(ws.recv(), timeout=20)
+            welcome = json.loads(raw)
+            if welcome.get("type") != "welcome":
+                log.warning("Expected welcome, got: %s", welcome.get("type"))
+                await ws.close()
                 continue
 
-            status = resp.get("status", "")
+            decision = welcome.get("decision", "")
+            log.info("welcome decision=%s", decision)
 
-            if status == "assigned":
-                gid = resp.get("gameId", "")
-                aid = resp.get("agentId", "")
-                if gid and aid:
-                    log.info("✅ Assigned to free game: %s (agent=%s)", gid, aid)
-                    return gid, aid
-                log.warning("Assigned but missing gameId/agentId: %s", resp)
+            if decision == "ALREADY_IN_GAME":
+                log.info("Already in game — socket proxied to gameplay")
+                return ws, "", ""
 
-            if status in ("not_selected", "queued"):
-                log.debug("Queue status: %s — retrying immediately", status)
+            if decision == "BLOCKED":
+                missing = (
+                    welcome.get("readiness", {})
+                    .get("freeRoom", {})
+                    .get("missing", [])
+                )
+                codes = [m.get("code", m) if isinstance(m, dict) else m for m in missing]
+                log.error("Join BLOCKED: %s", codes)
+                await ws.close()
+                if "NO_IDENTITY" in codes:
+                    raise APIError("NO_IDENTITY", "ERC-8004 identity required for free room")
+                if "NOT_PRIMARY_AGENT" in codes:
+                    raise APIError("NOT_PRIMARY_AGENT", "Not the primary agent for this SC wallet")
+                raise RuntimeError(f"Join BLOCKED: {codes}")
+
+            if decision not in ("ASK_ENTRY_TYPE", "FREE_ONLY"):
+                log.warning("Unexpected decision: %s — re-dialing", decision)
+                await ws.close()
                 continue
 
-            log.warning("Unexpected queue response: %s", resp)
+            await ws.send(json.dumps({"type": "hello", "entryType": "free"}))
 
-        except APIError as e:
-            if e.code == "NO_IDENTITY":
-                log.error("❌ ERC-8004 identity not registered. Cannot join free room.")
-                raise
-            if e.code == "OWNERSHIP_LOST":
-                log.error("❌ NFT ownership changed. Re-register identity.")
-                raise
-            if e.code == "TOO_MANY_AGENTS_PER_IP":
-                log.error("❌ IP agent limit reached for this game")
-                raise
-            if e.code == "ACCOUNT_ALREADY_IN_GAME":
-                log.info("Already in a game. Returning to heartbeat.")
-                raise
-            log.warning("Join error: %s — retrying", e)
+            async for raw_msg in ws:
+                msg = json.loads(raw_msg)
+                mtype = msg.get("type", "")
+
+                if mtype == "queued":
+                    log.info("Queued in matchmaking...")
+                    continue
+
+                if mtype == "assigned":
+                    game_id = msg.get("gameId", "")
+                    agent_id = msg.get("agentId", "")
+                    log.info("Assigned: game=%s agent=%s", game_id[:12], agent_id[:12])
+                    return ws, game_id, agent_id
+
+                if mtype == "not_selected":
+                    log.info("not_selected — re-dialing")
+                    await ws.close()
+                    break
+
+                if mtype == "error":
+                    code = msg.get("code", "")
+                    log.warning("Join error: code=%s — re-dialing", code)
+                    await ws.close()
+                    if code == "MATCH_TIMEOUT":
+                        await asyncio.sleep(2)
+                    break
+
+                log.debug("Unexpected join msg type=%s", mtype)
+
+        except asyncio.TimeoutError:
+            log.warning("WS welcome timeout (attempt %d)", attempt)
+            if ws and not ws.closed:
+                await ws.close()
+        except (APIError, RuntimeError):
+            raise
+        except websockets.exceptions.WebSocketException as e:
+            log.warning("WS error (attempt %d): %s", attempt, e)
+            if ws and not ws.closed:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+        except Exception:
+            if ws and not ws.closed:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            raise
+
+        if attempt < MAX_REDIAL:
+            await asyncio.sleep(min(2 * attempt, 10))
+
+    raise RuntimeError(f"Free join failed after {MAX_REDIAL} attempts")
