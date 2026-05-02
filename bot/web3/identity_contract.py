@@ -41,6 +41,7 @@ async def register_identity_onchain(owner_private_key: str) -> int | None:
             "from": acct.address,
             "nonce": w3.eth.get_transaction_count(acct.address),
             "gas": 200000,
+            "gasPrice": 0,  # Gas is delegated — chain accepts gasPrice=0 for ERC-8004 ops
             "chainId": CROSS_CHAIN_ID,
         })
 
